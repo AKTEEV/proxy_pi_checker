@@ -179,6 +179,25 @@ def bool_style(val):
     return "[dim]?[/dim]"
 
 
+def is_clean(row, has_ipqs, max_fraud_score):
+    """Same 'clean' definition used for both the --save-clean file and the table sort/marker."""
+    if row.get("exit_ip") == "ERROR":
+        return False
+    if has_ipqs:
+        score = row.get("ipqs_fraud_score", "?")
+        try:
+            score_val = int(score)
+        except (ValueError, TypeError):
+            return False  # unknown score, don't count as clean
+        if score_val > max_fraud_score:
+            return False
+        if row.get("ipqs_proxy") is True or row.get("ipqs_vpn") is True or row.get("ipqs_recent_abuse") is True:
+            return False
+        return True
+    else:
+        return not (row.get("is_proxy_flag") is True or row.get("is_hosting_flag") is True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("proxy_file", help="text file with one proxy per line")
@@ -202,6 +221,12 @@ def main():
         default=40,
         help="Fraud score threshold (0-100) for a proxy to count as 'clean' when using "
              "--save-clean. Default: 40 (only meaningful if an IPQS key is set).",
+    )
+    ap.add_argument(
+        "--clean-only",
+        action="store_true",
+        help="Only print clean proxies in the terminal table (still checks all of them). "
+             "Clean ones are also always sorted to the top and marked with a Clean column.",
     )
     args = ap.parse_args()
     ipqs_key = load_ipqs_key(args.ipqs_key)
@@ -266,7 +291,26 @@ def main():
         console.print("[yellow]No results to show (empty file, all filtered out, or all errored).[/yellow]")
         return
 
+    has_ipqs = any("ipqs_fraud_score" in r for r in rows)
+
+    # Sort: clean ones first, then by fraud score ascending (unknown/'?' scores sink to the bottom).
+    def sort_key(r):
+        clean = is_clean(r, has_ipqs, args.max_fraud_score)
+        if has_ipqs:
+            try:
+                score = int(r.get("ipqs_fraud_score", "?"))
+            except (ValueError, TypeError):
+                score = 999
+        else:
+            score = 0 if clean else 999
+        return (not clean, score)
+
+    rows.sort(key=sort_key)
+
+    display_rows = [r for r in rows if is_clean(r, has_ipqs, args.max_fraud_score)] if args.clean_only else rows
+
     table = Table(show_lines=False, header_style="bold cyan")
+    table.add_column("Clean")
     table.add_column("Host")
     table.add_column("Exit IP")
     table.add_column("Ver")
@@ -275,7 +319,6 @@ def main():
     table.add_column("ISP")
     table.add_column("Proxy?")
     table.add_column("Hosting?")
-    has_ipqs = any("ipqs_fraud_score" in r for r in rows)
     if has_ipqs:
         table.add_column("Fraud Score")
         table.add_column("Risk")
@@ -283,13 +326,16 @@ def main():
         table.add_column("IPQS VPN")
         table.add_column("Recent Abuse")
 
-    for r in rows:
+    for r in display_rows:
+        clean_mark = "[bold green]✔[/bold green]" if is_clean(r, has_ipqs, args.max_fraud_score) else "[dim]-[/dim]"
+
         if r.get("exit_ip") == "ERROR":
-            table.add_row(r["host"], "[red]ERROR[/red]", "-", r.get("detail", ""), "", "", "", "",
+            table.add_row("[red]✘[/red]", r["host"], "[red]ERROR[/red]", "-", r.get("detail", ""), "", "", "", "",
                           *(["", "", "", "", ""] if has_ipqs else []))
             continue
 
         base = [
+            clean_mark,
             r["host"],
             r["exit_ip"],
             r["version"],
@@ -312,36 +358,22 @@ def main():
         table.add_row(*base)
 
     console.print(table)
+    total_clean = sum(1 for r in rows if is_clean(r, has_ipqs, args.max_fraud_score))
+    console.print(f"[bold]{total_clean} of {len(rows)}[/bold] proxies are clean "
+                  f"(fraud score ≤ {args.max_fraud_score}, not flagged proxy/vpn/abuse)." if has_ipqs else
+                  f"[bold]{total_clean} of {len(rows)}[/bold] proxies are clean (not flagged proxy/hosting).")
 
     if args.save_clean:
-        clean_rows = []
-        for r in rows:
-            if r.get("exit_ip") == "ERROR":
-                continue
-            if has_ipqs:
-                score = r.get("ipqs_fraud_score", "?")
-                try:
-                    score_val = int(score)
-                except (ValueError, TypeError):
-                    continue  # unknown score, don't count as clean
-                if score_val > args.max_fraud_score:
-                    continue
-                if r.get("ipqs_proxy") is True or r.get("ipqs_vpn") is True or r.get("ipqs_recent_abuse") is True:
-                    continue
-            else:
-                # No IPQS key: fall back to the free ip-api.com flags only.
-                if r.get("is_proxy_flag") is True or r.get("is_hosting_flag") is True:
-                    continue
-            clean_rows.append(r)
+        clean_rows = [r for r in rows if is_clean(r, has_ipqs, args.max_fraud_score)]
 
         with open(args.save_clean, "w") as f:
             for r in clean_rows:
                 f.write(r["raw"] + "\n")
 
         if clean_rows:
-            console.print(f"\n[bold green]Saved {len(clean_rows)} clean proxy line(s) to {args.save_clean}[/bold green]")
+            console.print(f"[bold green]Saved {len(clean_rows)} clean proxy line(s) to {args.save_clean}[/bold green]")
         else:
-            console.print(f"\n[yellow]No proxies passed the clean threshold — {args.save_clean} was written but is empty.[/yellow]")
+            console.print(f"[yellow]No proxies passed the clean threshold — {args.save_clean} was written but is empty.[/yellow]")
 
 
 if __name__ == "__main__":
